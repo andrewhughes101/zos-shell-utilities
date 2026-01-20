@@ -28,18 +28,20 @@ show_spinner() {
 
 # Function to display usage
 usage() {
-    echo "Usage: $0 <command> [options]"
-    echo ""
-    echo "Commands:"
-    echo "  list [pattern]           - List LOGR structures (default: LOG_*_A*)"
-    echo "  delete <logstream>       - Delete log stream(s) by name or pattern"
-    echo ""
-    echo "Examples:"
-    echo "  $0 list"
-    echo "  $0 list 'LOG_PROD_*'"
-    echo "  $0 delete IYCWEED1.DFHLOG"
-    echo "  $0 delete 'IYCWEED1.*'"
-    echo "  $0 delete 'IYCW*'"
+    cat << 'EOF'
+Usage: logr_manager <command> [options]
+
+Commands:
+  list [pattern]           - List LOGR structures (default: LOG_*)
+  delete <logstream>       - Delete log stream(s) by name or pattern
+
+Examples:
+  logr_manager list
+  logr_manager list 'LOG_PROD_*'
+  logr_manager delete IYCWEED1.DFHLOG
+  logr_manager delete 'IYCWEED1.*'
+  logr_manager delete 'IYCW*'
+EOF
     exit 1
 }
 
@@ -65,29 +67,54 @@ execute_ixcmiapu() {
     return $?
 }
 
+# Function to check if line should be filtered
+is_filtered_line() {
+    LINE="$1"
+    case "$LINE" in
+        ""|"-"*|"+"*|"LOGSTREAM"|"CONNECTION") return 0 ;;
+        *"ADMINISTRATIVE"*) return 0 ;;
+        LOG_*_[0-9]*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # Function to parse log streams from IXCMIAPU output
 parse_logstreams() {
     OUTFILE="$1"
     PATTERN="$2"
-
     IN_LOGSTREAM_LIST=0
     RESULT=""
 
     while IFS= read -r line; do
-        if echo "$line" | grep -q "LOGSTREAM NAME.*CONNECTION"; then
+        # Check for section markers
+        echo "$line" | grep "LOGSTREAM NAME.*CONNECTION" > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
             IN_LOGSTREAM_LIST=1
             continue
         fi
 
-        if echo "$line" | grep -q "LOGSTREAMS CURRENTLY DEFINED"; then
+        echo "$line" | grep "LOGSTREAMS CURRENTLY DEFINED" > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
             IN_LOGSTREAM_LIST=0
             continue
         fi
 
+        # Parse log stream names
         if [ $IN_LOGSTREAM_LIST -eq 1 ]; then
-            STREAM=$(echo "$line" | awk '{print $1}' | grep -v "^$" | grep -v "^-" | grep -v "LOGSTREAM")
-            if [ -n "$STREAM" ] && [ "$STREAM" != "CONNECTION" ]; then
-                if [ -z "$PATTERN" ] || echo "$STREAM" | grep -qE "$PATTERN"; then
+            STREAM=$(echo "$line" | awk '{print $1}')
+
+            if is_filtered_line "$STREAM"; then
+                continue
+            fi
+
+            if [ -n "$STREAM" ]; then
+                if [ -n "$PATTERN" ]; then
+                    echo "$STREAM" | grep -E "$PATTERN" > /dev/null 2>&1
+                    if [ $? -eq 0 ]; then
+                        RESULT="$RESULT$STREAM
+"
+                    fi
+                else
                     RESULT="$RESULT$STREAM
 "
                 fi
@@ -136,7 +163,7 @@ EOF
 
     execute_ixcmiapu "$TEMPIN" "$TEMPOUT"
 
-    # Format output
+    # Format output header
     echo ""
     echo "=========================================="
     echo "LOGR STRUCTURES AND LOG STREAMS"
@@ -148,28 +175,38 @@ EOF
     IN_LOGSTREAM_LIST=0
 
     while IFS= read -r line; do
-        if echo "$line" | grep -q "STRUCTURE NAME("; then
+        # Check for structure name
+        echo "$line" | grep "STRUCTURE NAME(" > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
             CURRENT_STRUCT=$(echo "$line" | sed 's/.*STRUCTURE NAME(\([^)]*\)).*/\1/')
             IN_LOGSTREAM_LIST=0
+            continue
         fi
 
-        if echo "$line" | grep -q "LOGSTREAM NAME.*CONNECTION"; then
+        # Check for log stream section start
+        echo "$line" | grep "LOGSTREAM NAME.*CONNECTION" > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
             IN_LOGSTREAM_LIST=1
             continue
         fi
 
-        if echo "$line" | grep -q "LOGSTREAMS CURRENTLY DEFINED"; then
+        # Check for log stream section end
+        echo "$line" | grep "LOGSTREAMS CURRENTLY DEFINED" > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
             IN_LOGSTREAM_LIST=0
             continue
         fi
 
+        # Parse and display log streams
         if [ $IN_LOGSTREAM_LIST -eq 1 ] && [ -n "$CURRENT_STRUCT" ]; then
-            LOGSTREAM=$(echo "$line" | awk '{print $1}' | grep -v "^$" | grep -v "^-" | grep -v "^+" | grep -v "LOGSTREAM")
-            if [ -n "$LOGSTREAM" ] && [ "$LOGSTREAM" != "CONNECTION" ]; then
-                # Filter out IXCMIAPU administrative headers and formatting lines
-                if ! echo "$LOGSTREAM" | grep -qE "^[0-9]+ADMINISTRATIVE$|^LOG_.*[0-9]+$"; then
-                    printf "%-30s %-40s\n" "$CURRENT_STRUCT" "$LOGSTREAM"
-                fi
+            LOGSTREAM=$(echo "$line" | awk '{print $1}')
+
+            if is_filtered_line "$LOGSTREAM"; then
+                continue
+            fi
+
+            if [ -n "$LOGSTREAM" ]; then
+                printf "%-30s %-40s\n" "$CURRENT_STRUCT" "$LOGSTREAM"
             fi
         fi
     done < "$TEMPOUT"
@@ -189,7 +226,8 @@ delete_logstream() {
     fi
 
     # Check if wildcard is used
-    if echo "$LOGSTREAM" | grep -q '\*'; then
+    echo "$LOGSTREAM" | grep '\*' > /dev/null 2>&1
+    if [ $? -eq 0 ]; then
         # Wildcard pattern - expand to explicit names
         echo "Wildcard detected in pattern: $LOGSTREAM"
         echo "Expanding to explicit log stream names..."
@@ -246,9 +284,19 @@ delete_logstream() {
 
     echo ""
     if [ $RC -eq 0 ]; then
-        [ $STREAM_COUNT -eq 1 ] && echo "Successfully deleted log stream: $LOGSTREAM" || echo "Successfully deleted $STREAM_COUNT log stream(s)"
+        if [ $STREAM_COUNT -eq 1 ]; then
+            echo "Successfully deleted log stream: $LOGSTREAM"
+        else
+            echo "Successfully deleted $STREAM_COUNT log stream(s)"
+        fi
     else
-        [ $STREAM_COUNT -eq 1 ] && echo "Error deleting log stream: $LOGSTREAM (RC=$RC)" || echo "Error during deletion (RC=$RC)"
+        if [ $STREAM_COUNT -eq 1 ]; then
+            echo "Error deleting log stream: $LOGSTREAM (RC=$RC)"
+        else
+            echo "Error during deletion (RC=$RC)"
+        fi
+        echo ""
+        echo "Error details:"
         grep "IXG.*E" "$TEMPOUT" 2>/dev/null
     fi
 
