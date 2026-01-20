@@ -74,14 +74,12 @@ parse_logstreams() {
     RESULT=""
 
     while IFS= read -r line; do
-        echo "$line" | grep "LOGSTREAM NAME.*CONNECTION" > /dev/null 2>&1
-        if [ $? -eq 0 ]; then
+        if echo "$line" | grep -q "LOGSTREAM NAME.*CONNECTION"; then
             IN_LOGSTREAM_LIST=1
             continue
         fi
 
-        echo "$line" | grep "LOGSTREAMS CURRENTLY DEFINED" > /dev/null 2>&1
-        if [ $? -eq 0 ]; then
+        if echo "$line" | grep -q "LOGSTREAMS CURRENTLY DEFINED"; then
             IN_LOGSTREAM_LIST=0
             continue
         fi
@@ -89,13 +87,7 @@ parse_logstreams() {
         if [ $IN_LOGSTREAM_LIST -eq 1 ]; then
             STREAM=$(echo "$line" | awk '{print $1}' | grep -v "^$" | grep -v "^-" | grep -v "LOGSTREAM")
             if [ -n "$STREAM" ] && [ "$STREAM" != "CONNECTION" ]; then
-                if [ -n "$PATTERN" ]; then
-                    echo "$STREAM" | grep -E "$PATTERN" > /dev/null 2>&1
-                    if [ $? -eq 0 ]; then
-                        RESULT="$RESULT$STREAM
-"
-                    fi
-                else
+                if [ -z "$PATTERN" ] || echo "$STREAM" | grep -qE "$PATTERN"; then
                     RESULT="$RESULT$STREAM
 "
                 fi
@@ -129,7 +121,7 @@ EOF
 
 # Function to list LOGR structures
 list_structures() {
-    PATTERN="${1:-LOG_*_A*}"
+    PATTERN="${1:-LOG_*}"
 
     echo "Listing LOGR structures matching: $PATTERN"
     echo ""
@@ -156,28 +148,28 @@ EOF
     IN_LOGSTREAM_LIST=0
 
     while IFS= read -r line; do
-        echo "$line" | grep "STRUCTURE NAME(" > /dev/null 2>&1
-        if [ $? -eq 0 ]; then
+        if echo "$line" | grep -q "STRUCTURE NAME("; then
             CURRENT_STRUCT=$(echo "$line" | sed 's/.*STRUCTURE NAME(\([^)]*\)).*/\1/')
             IN_LOGSTREAM_LIST=0
         fi
 
-        echo "$line" | grep "LOGSTREAM NAME.*CONNECTION" > /dev/null 2>&1
-        if [ $? -eq 0 ]; then
+        if echo "$line" | grep -q "LOGSTREAM NAME.*CONNECTION"; then
             IN_LOGSTREAM_LIST=1
             continue
         fi
 
-        echo "$line" | grep "LOGSTREAMS CURRENTLY DEFINED" > /dev/null 2>&1
-        if [ $? -eq 0 ]; then
+        if echo "$line" | grep -q "LOGSTREAMS CURRENTLY DEFINED"; then
             IN_LOGSTREAM_LIST=0
             continue
         fi
 
         if [ $IN_LOGSTREAM_LIST -eq 1 ] && [ -n "$CURRENT_STRUCT" ]; then
-            LOGSTREAM=$(echo "$line" | awk '{print $1}' | grep -v "^$" | grep -v "^-" | grep -v "LOGSTREAM")
+            LOGSTREAM=$(echo "$line" | awk '{print $1}' | grep -v "^$" | grep -v "^-" | grep -v "^+" | grep -v "LOGSTREAM")
             if [ -n "$LOGSTREAM" ] && [ "$LOGSTREAM" != "CONNECTION" ]; then
-                printf "%-30s %-40s\n" "$CURRENT_STRUCT" "$LOGSTREAM"
+                # Filter out IXCMIAPU administrative headers and formatting lines
+                if ! echo "$LOGSTREAM" | grep -qE "^[0-9]+ADMINISTRATIVE$|^LOG_.*[0-9]+$"; then
+                    printf "%-30s %-40s\n" "$CURRENT_STRUCT" "$LOGSTREAM"
+                fi
             fi
         fi
     done < "$TEMPOUT"
@@ -197,8 +189,7 @@ delete_logstream() {
     fi
 
     # Check if wildcard is used
-    echo "$LOGSTREAM" | grep '\*' > /dev/null 2>&1
-    if [ $? -eq 0 ]; then
+    if echo "$LOGSTREAM" | grep -q '\*'; then
         # Wildcard pattern - expand to explicit names
         echo "Wildcard detected in pattern: $LOGSTREAM"
         echo "Expanding to explicit log stream names..."
@@ -253,20 +244,11 @@ delete_logstream() {
     execute_ixcmiapu "$TEMPIN" "$TEMPOUT"
     RC=$?
 
+    echo ""
     if [ $RC -eq 0 ]; then
-        echo ""
-        if [ $STREAM_COUNT -eq 1 ]; then
-            echo "Successfully deleted log stream: $LOGSTREAM"
-        else
-            echo "Successfully deleted $STREAM_COUNT log stream(s)"
-        fi
+        [ $STREAM_COUNT -eq 1 ] && echo "Successfully deleted log stream: $LOGSTREAM" || echo "Successfully deleted $STREAM_COUNT log stream(s)"
     else
-        echo ""
-        if [ $STREAM_COUNT -eq 1 ]; then
-            echo "Error deleting log stream: $LOGSTREAM (RC=$RC)"
-        else
-            echo "Error during deletion (RC=$RC)"
-        fi
+        [ $STREAM_COUNT -eq 1 ] && echo "Error deleting log stream: $LOGSTREAM (RC=$RC)" || echo "Error during deletion (RC=$RC)"
         grep "IXG.*E" "$TEMPOUT" 2>/dev/null
     fi
 
@@ -300,5 +282,3 @@ case "$COMMAND" in
 esac
 
 exit $?
-
-# Made with Bob
