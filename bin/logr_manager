@@ -38,9 +38,9 @@ Commands:
 Examples:
   logr_manager list
   logr_manager list 'LOG_PROD_*'
-  logr_manager delete IYCWEED1.DFHLOG
-  logr_manager delete 'IYCWEED1.*'
-  logr_manager delete 'IYCW*'
+  logr_manager delete MYCICS.DFHLOG
+  logr_manager delete 'MYCICS.*'
+  logr_manager delete 'MY*'
 EOF
     exit 1
 }
@@ -148,7 +148,16 @@ EOF
 
 # Function to list LOGR structures
 list_structures() {
-    PATTERN="${1:-LOG_*}"
+    # Check if multiple arguments were passed (shell expanded wildcard)
+    if [ $# -gt 1 ]; then
+        echo "Warning: Multiple arguments detected. Shell may have expanded wildcards."
+        echo "Falling back to default pattern: LOG_*"
+        echo "Tip: Use quotes to prevent shell expansion: logr_manager list '*'"
+        echo ""
+        PATTERN="LOG_*"
+    else
+        PATTERN="${1:-LOG_*}"
+    fi
 
     echo "Listing LOGR structures matching: $PATTERN"
     echo ""
@@ -314,6 +323,7 @@ shift
 
 case "$COMMAND" in
     list)
+        # Pass all arguments to handle multiple args detection
         list_structures "$@"
         ;;
     delete)
