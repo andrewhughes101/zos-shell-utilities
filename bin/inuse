@@ -4,7 +4,6 @@
 # Shows which jobs/systems are using a specified dataset
 #
 
-# Function to display usage
 usage() {
     cat << 'EOF'
 Usage: inuse [OPTIONS] <dataset>
@@ -12,14 +11,14 @@ Usage: inuse [OPTIONS] <dataset>
 Check which jobs/systems are using a z/OS dataset.
 
 Arguments:
-  dataset              Dataset name to check (e.g., HUGHEA.CBSA.LOADLIB)
+  dataset              Dataset name to check (e.g., SOME.LOAD.LIB)
 
 Options:
   -j, --json          Output in JSON format
   -h, --help          Display this help message
 
 Examples:
-  inuse HUGHEA.CBSA.LOADLIB
+  inuse SOME.LOAD.LIB
   inuse --json MY.DATASET.NAME
   inuse -j USER.PROD.LOADLIB
 
@@ -31,7 +30,6 @@ EOF
     exit 1
 }
 
-# Function to check if ZOAU is available
 check_zoau() {
     if ! command -v opercmd >/dev/null 2>&1; then
         echo "Error: ZOAU is not available or not in PATH" >&2
@@ -41,137 +39,99 @@ check_zoau() {
     fi
 }
 
-# Function to parse GRS output and format as human-readable
-parse_grs_output_human() {
-    OUTPUT="$1"
-    DATASET="$2"
-
-    # Extract current LPAR name from first line
-    CURRENT_LPAR=$(echo "$OUTPUT" | head -1 | awk '{print $1}')
+# Parse GRS output into pipe-delimited format: LPAR|JOBNAME|ASID|TCBADDR|LOCK|STATUS
+parse_grs_data() {
+    _output="$1"
+    _dataset="$2"
 
     # Check if dataset is in use
-    if ! echo "$OUTPUT" | grep -q "SYSDSN.*$DATASET"; then
-        echo "Dataset: $DATASET"
+    if ! echo "$_output" | grep -q "SYSDSN.*$_dataset"; then
+        return 1
+    fi
+
+    # Parse using AWK for better performance
+    echo "$_output" | awk -v dataset="$_dataset" '
+        # Found the header line - start processing data
+        /SYSNAME.*JOBNAME.*ASID.*TCBADDR.*EXC\/SHR.*STATUS/ {
+            in_data = 1
+            next
+        }
+
+        # Process data lines
+        in_data && NF >= 6 {
+            # Extract fields and output in pipe-delimited format
+            printf "%s|%s|%s|%s|%s|%s\n", $1, $2, $3, $4, $5, $6
+        }
+    '
+
+    return 0
+}
+
+format_output_human() {
+    _dataset="$1"
+    _data="$2"
+
+    echo "Dataset: $_dataset"
+
+    if [ -z "$_data" ]; then
         echo "Status: Not currently in use"
         return 0
     fi
 
-    echo "Dataset: $DATASET"
     echo "Status: In use"
     echo ""
-    printf "%-10s %-16s %-8s %-12s %-10s %-10s\n" "LPAR" "JOBNAME" "ASID" "TCBADDR" "LOCK" "STATUS"
+    printf "%-10s %-16s %-8s %-12s %-10s %-10s\n" \
+        "LPAR" "JOBNAME" "ASID" "TCBADDR" "LOCK" "STATUS"
     echo "--------------------------------------------------------------------------------"
 
-    # Parse the output line by line
-    IN_DATA_SECTION=0
-    echo "$OUTPUT" | while IFS= read -r line; do
-        # Check if we've reached the data section
-        if echo "$line" | grep -q "SYSNAME.*JOBNAME.*ASID.*TCBADDR.*EXC/SHR.*STATUS"; then
-            IN_DATA_SECTION=1
-            continue
-        fi
-
-        # Parse data lines
-        if [ $IN_DATA_SECTION -eq 1 ]; then
-            # Skip empty lines
-            if [ -z "$(echo "$line" | tr -d '[:space:]')" ]; then
-                continue
-            fi
-
-            # Extract fields (handle variable whitespace)
-            LPAR=$(echo "$line" | awk '{print $1}')
-            JOBNAME=$(echo "$line" | awk '{print $2}')
-            ASID=$(echo "$line" | awk '{print $3}')
-            TCBADDR=$(echo "$line" | awk '{print $4}')
-            LOCK=$(echo "$line" | awk '{print $5}')
-            STATUS=$(echo "$line" | awk '{print $6}')
-
-            # Only print if we have valid data
-            if [ -n "$LPAR" ] && [ -n "$JOBNAME" ]; then
-                printf "%-10s %-16s %-8s %-12s %-10s %-10s\n" "$LPAR" "$JOBNAME" "$ASID" "$TCBADDR" "$LOCK" "$STATUS"
-            fi
-        fi
+    # Process each line of data
+    echo "$_data" | while IFS='|' read -r lpar jobname asid tcbaddr lock status; do
+        printf "%-10s %-16s %-8s %-12s %-10s %-10s\n" \
+            "$lpar" "$jobname" "$asid" "$tcbaddr" "$lock" "$status"
     done
 }
 
-# Function to parse GRS output and format as JSON
-parse_grs_output_json() {
-    OUTPUT="$1"
-    DATASET="$2"
+format_output_json() {
+    _dataset="$1"
+    _data="$2"
 
-    # Extract current LPAR name
-    CURRENT_LPAR=$(echo "$OUTPUT" | head -1 | awk '{print $1}')
+    echo "{"
+    echo "  \"dataset\": \"$_dataset\","
 
-    # Check if dataset is in use
-    if ! echo "$OUTPUT" | grep -q "SYSDSN.*$DATASET"; then
-        cat << EOF
-{
-  "dataset": "$DATASET",
-  "in_use": false,
-  "users": []
-}
-EOF
+    if [ -z "$_data" ]; then
+        echo "  \"in_use\": false,"
+        echo "  \"users\": []"
+        echo "}"
         return 0
     fi
 
-    # Start JSON output
-    echo "{"
-    echo "  \"dataset\": \"$DATASET\","
     echo "  \"in_use\": true,"
     echo "  \"users\": ["
 
-    # Parse the output
-    IN_DATA_SECTION=0
-    FIRST_ENTRY=1
-    echo "$OUTPUT" | while IFS= read -r line; do
-        # Check if we've reached the data section
-        if echo "$line" | grep -q "SYSNAME.*JOBNAME.*ASID.*TCBADDR.*EXC/SHR.*STATUS"; then
-            IN_DATA_SECTION=1
-            continue
+    # Process each line and format as JSON
+    _first=1
+    echo "$_data" | while IFS='|' read -r lpar jobname asid tcbaddr lock status; do
+        if [ $_first -eq 0 ]; then
+            echo ","
         fi
-
-        # Parse data lines
-        if [ $IN_DATA_SECTION -eq 1 ]; then
-            # Skip empty lines
-            if [ -z "$(echo "$line" | tr -d '[:space:]')" ]; then
-                continue
-            fi
-
-            # Extract fields
-            LPAR=$(echo "$line" | awk '{print $1}')
-            JOBNAME=$(echo "$line" | awk '{print $2}')
-            ASID=$(echo "$line" | awk '{print $3}')
-            TCBADDR=$(echo "$line" | awk '{print $4}')
-            LOCK=$(echo "$line" | awk '{print $5}')
-            STATUS=$(echo "$line" | awk '{print $6}')
-
-            # Only output if we have valid data
-            if [ -n "$LPAR" ] && [ -n "$JOBNAME" ]; then
-                if [ $FIRST_ENTRY -eq 0 ]; then
-                    echo ","
-                fi
-                cat << EOF
+        cat << EOF
     {
-      "lpar": "$LPAR",
-      "jobname": "$JOBNAME",
-      "asid": "$ASID",
-      "tcbaddr": "$TCBADDR",
-      "lock_type": "$LOCK",
-      "status": "$STATUS"
+      "lpar": "$lpar",
+      "jobname": "$jobname",
+      "asid": "$asid",
+      "tcbaddr": "$tcbaddr",
+      "lock_type": "$lock",
+      "status": "$status"
     }
 EOF
-                FIRST_ENTRY=0
-            fi
-        fi
+        _first=0
     done
 
     echo "  ]"
     echo "}"
 }
 
-# Main script
-main() {
-    # Parse arguments
+parse_arguments() {
     JSON_OUTPUT=0
     DATASET=""
 
@@ -202,31 +162,47 @@ main() {
         esac
     done
 
-    # Check if dataset was provided
+    # Validate dataset was provided
     if [ -z "$DATASET" ]; then
         echo "Error: Dataset name required" >&2
         echo "Use -h or --help for usage information" >&2
         exit 1
     fi
+}
+
+query_dataset_usage() {
+    _dataset="$1"
+
+    _output=$(opercmd -v -w "d grs,res=(*,'$_dataset') scope=*" 2>&1)
+    _rc=$?
+
+    if [ $_rc -ne 0 ]; then
+        echo "Error: Failed to execute opercmd (RC=$_rc)" >&2
+        echo "$_output" >&2
+        exit 1
+    fi
+
+    echo "$_output"
+}
+
+main() {
+    # Parse command line arguments
+    parse_arguments "$@"
 
     # Validate ZOAU is available
     check_zoau
 
-    # Execute opercmd to check dataset usage
-    OUTPUT=$(opercmd -v -w "d grs,res=(*,'$DATASET') scope=*" 2>&1)
-    RC=$?
+    # Query GRS for dataset usage
+    grs_output=$(query_dataset_usage "$DATASET")
 
-    if [ $RC -ne 0 ]; then
-        echo "Error: Failed to execute opercmd (RC=$RC)" >&2
-        echo "$OUTPUT" >&2
-        exit 1
-    fi
+    # Parse the GRS output
+    parsed_data=$(parse_grs_data "$grs_output" "$DATASET")
 
-    # Parse and display output
+    # Format and display output
     if [ $JSON_OUTPUT -eq 1 ]; then
-        parse_grs_output_json "$OUTPUT" "$DATASET"
+        format_output_json "$DATASET" "$parsed_data"
     else
-        parse_grs_output_human "$OUTPUT" "$DATASET"
+        format_output_human "$DATASET" "$parsed_data"
     fi
 }
 
