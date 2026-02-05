@@ -151,7 +151,8 @@ parse_arguments() {
                 ;;
             *)
                 if [ -z "$DATASET" ]; then
-                    DATASET="$1"
+                    # Convert dataset name to uppercase for z/OS compatibility
+                    DATASET=$(echo "$1" | tr '[:lower:]' '[:upper:]')
                 else
                     echo "Error: Multiple datasets specified" >&2
                     echo "Use -h or --help for usage information" >&2
