@@ -1,4 +1,4 @@
-# zos-shell
+# zos-shell-utilities
 
 A collection of z/OS shell utilities for mainframe system administration.
 
