@@ -4,27 +4,15 @@
 # Manages LOGR structures and log streams using IXCMIAPU
 #
 
+# Get script directory and source libraries
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LIB_DIR="$SCRIPT_DIR/../lib"
+
+. "$LIB_DIR/common.sh"
+. "$LIB_DIR/zoau_utils.sh"
+
 # Set temporary directory
 TMPDIR="${TMPDIR:-/tmp}"
-
-# Function to show a spinner while a command runs
-show_spinner() {
-    PID=$1
-    while kill -0 $PID 2>/dev/null; do
-        printf "\r| Processing..."
-        sleep 1
-        if ! kill -0 $PID 2>/dev/null; then break; fi
-        printf "\r/ Processing..."
-        sleep 1
-        if ! kill -0 $PID 2>/dev/null; then break; fi
-        printf "\r- Processing..."
-        sleep 1
-        if ! kill -0 $PID 2>/dev/null; then break; fi
-        printf "\r\\ Processing..."
-        sleep 1
-    done
-    printf "\r                    \r"
-}
 
 # Function to display usage
 usage() {

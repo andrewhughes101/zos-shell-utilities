@@ -1,0 +1,468 @@
+#!/bin/sh
+#
+# jcl2mvscmd - JCL to mvscmd Translation Tool
+# Converts JCL batch jobs to shell scripts using mvscmd
+#
+
+# Get script directory
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LIB_DIR="$SCRIPT_DIR/../lib"
+
+# Source library modules
+. "$LIB_DIR/common.sh"
+. "$LIB_DIR/jcl_parser.sh"
+. "$LIB_DIR/mvscmd_generator.sh"
+. "$LIB_DIR/output_formatter.sh"
+. "$LIB_DIR/zoau_utils.sh"
+
+# Default configuration
+DEFAULT_LOG_DIR="./logs"
+OUTPUT_FILE=""
+DRY_RUN=0
+JCL_FILE=""
+SYMBOL_OVERRIDES=""
+
+# Display usage information
+usage() {
+    cat << 'EOF'
+Usage: jcl2mvscmd [OPTIONS] <jcl-file>
+
+Convert JCL batch jobs to shell scripts using mvscmd.
+
+Arguments:
+  jcl-file                JCL file to translate
+
+Options:
+  -o, --output <file>     Output shell script file (default: stdout)
+  -l, --log-dir <dir>     Log directory path (default: ./logs)
+  -s, --symbol <name=val> Override JCL symbol value (repeatable)
+  -v, --verbose           Verbose output
+  -d, --dry-run           Show translation without writing file
+  -h, --help              Display this help message
+
+Examples:
+  jcl2mvscmd myjob.jcl -o myjob.sh
+  jcl2mvscmd myjob.jcl -o myjob.sh --log-dir /var/log/batch
+  jcl2mvscmd myjob.jcl --symbol INFILE=MY.DATA --symbol OUTFILE=MY.OUT
+  jcl2mvscmd myjob.jcl --dry-run
+
+Supported JCL Features:
+  - EXEC PGM= statements
+  - DD statements (DSN, DISP, SYSOUT)
+  - Concatenated datasets
+  - JCL symbols (SET statements)
+  - Inline data (DD *)
+  - DUMMY datasets
+  - PARM parameters
+
+Limitations:
+  - Does not support JCL procedures (PROC)
+  - Does not support complex conditional logic (IF/THEN/ELSE)
+  - Does not support COND parameters
+  - Does not support GDG references
+  - Does not support tape datasets
+
+EOF
+    exit 1
+}
+
+# Parse command-line arguments
+parse_arguments() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                usage
+                ;;
+            -v|--verbose)
+                VERBOSE=1
+                shift
+                ;;
+            -d|--dry-run)
+                DRY_RUN=1
+                shift
+                ;;
+            -a|--auth)
+                USE_AUTH=1
+                shift
+                ;;
+            -o|--output)
+                OUTPUT_FILE="$2"
+                shift 2
+                ;;
+            --output=*)
+                OUTPUT_FILE=$(extract_value "$1")
+                shift
+                ;;
+            -l|--log-dir)
+                LOG_DIR="$2"
+                shift 2
+                ;;
+            --log-dir=*)
+                LOG_DIR=$(extract_value "$1")
+                shift
+                ;;
+            -s|--symbol)
+                SYMBOL_OVERRIDES="$SYMBOL_OVERRIDES$2
+"
+                shift 2
+                ;;
+            --symbol=*)
+                _sym=$(extract_value "$1")
+                SYMBOL_OVERRIDES="$SYMBOL_OVERRIDES$_sym
+"
+                shift
+                ;;
+            -*)
+                error_exit "Unknown option: $1"
+                ;;
+            *)
+                if [ -z "$JCL_FILE" ]; then
+                    JCL_FILE="$1"
+                else
+                    error_exit "Multiple JCL files specified"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate required arguments
+    validate_required "$JCL_FILE" "JCL file"
+
+    # Set default log directory
+    LOG_DIR="${LOG_DIR:-$DEFAULT_LOG_DIR}"
+
+    verbose "JCL file: $JCL_FILE"
+    verbose "Output file: ${OUTPUT_FILE:-stdout}"
+    verbose "Log directory: $LOG_DIR"
+    verbose "Dry run: $DRY_RUN"
+}
+
+# Main translation logic
+translate_jcl() {
+    _jcl_file="$1"
+    _input_type=""
+    _is_dataset=0
+
+    verbose "Analyzing input: $_jcl_file"
+
+    # Detect input type based on pattern
+    if echo "$_jcl_file" | grep -q "(.*)" ; then
+        # PDS member pattern: DATASET.NAME(MEMBER)
+        _input_type="dataset_member"
+        _is_dataset=1
+        verbose "Detected PDS member pattern"
+    elif echo "$_jcl_file" | grep -Eq "^(\./|/)" ; then
+        # Explicit Unix path: ./file or /path/to/file
+        _input_type="unix_file"
+        verbose "Detected explicit Unix path"
+    elif [ -f "$_jcl_file" ]; then
+        # File exists in current directory
+        _input_type="unix_file"
+        verbose "Found Unix file in current directory"
+    else
+        # Ambiguous - could be dataset or non-existent file
+        # Check if dataset exists using dls (no // prefix needed)
+        if dls -q "$_jcl_file" 2>/dev/null; then
+            # Dataset exists - ask user to confirm
+            echo "Found MVS dataset: $_jcl_file"
+            printf "Use this dataset? (y/n): "
+            read -r _response
+            case "$_response" in
+                y|Y|yes|Yes|YES)
+                    _input_type="dataset"
+                    _is_dataset=1
+                    ;;
+                *)
+                    error_exit "Input not found: $_jcl_file (not a Unix file or confirmed dataset)"
+                    ;;
+            esac
+        else
+            error_exit "Input not found: $_jcl_file (not a Unix file or MVS dataset)"
+        fi
+    fi
+
+    # Read JCL content based on detected type
+    if [ $_is_dataset -eq 1 ]; then
+        verbose "Reading MVS dataset: $_jcl_file"
+        # dcat takes dataset name directly in quotes (no // prefix)
+        _jcl_content=$(dcat "$_jcl_file" 2>/dev/null || error_exit "Failed to read dataset: $_jcl_file")
+    else
+        verbose "Reading Unix file: $_jcl_file"
+        _jcl_content=$(cat "$_jcl_file" 2>/dev/null || error_exit "Failed to read file: $_jcl_file")
+    fi
+
+    # Export USE_AUTH so it's available to generator functions
+    export USE_AUTH
+
+    # Parse job name
+    _jobname=$(parse_jcl_job "$_jcl_content")
+    verbose "Job name: $_jobname"
+
+    # Parse symbols
+    _symbols=$(parse_jcl_symbols "$_jcl_content")
+
+    # Apply symbol overrides
+    if [ -n "$SYMBOL_OVERRIDES" ]; then
+        verbose "Applying symbol overrides"
+        # Merge overrides with parsed symbols
+        _symbols="$SYMBOL_OVERRIDES$_symbols"
+    fi
+
+    # Generate script header
+    _script=$(generate_script_header "$_jobname" "$_jcl_file")
+
+    # Generate parameter section
+    if [ -n "$_symbols" ]; then
+        _script="$_script
+$(generate_parameter_section "$_symbols")"
+    fi
+
+    # Parse and generate each step
+    _in_step=0
+    _current_step=""
+    _current_pgm=""
+    _current_parm=""
+    _dd_options=""
+    _inline_dds=""
+    _log_files=""
+    _sysin_content=""
+    _step_counter=0
+    _last_ddname=""
+    _concat_datasets=""
+
+    # Use process substitution to avoid subshell issues with pipe
+    _in_inline_data=0
+    while IFS= read -r _line; do
+        # Skip comments and empty lines
+        if [ -z "$_line" ] || echo "$_line" | grep -q "^//\*"; then
+            continue
+        fi
+
+        # Check if we're exiting inline data section
+        if [ $_in_inline_data -eq 1 ] && echo "$_line" | grep -q "^/\*"; then
+            _in_inline_data=0
+            continue
+        fi
+
+        # Skip lines that are inside inline data sections (but not the DD * line itself)
+        if [ $_in_inline_data -eq 1 ]; then
+            continue
+        fi
+
+        # Check for EXEC statement
+        if echo "$_line" | grep -q " EXEC "; then
+            # If we were processing a previous step, generate it
+            if [ -n "$_current_step" ]; then
+                # Flush any pending concatenated datasets
+                if [ -n "$_concat_datasets" ] && [ -n "$_last_ddname" ]; then
+                    _dd_opt=$(map_dd_to_option "$_last_ddname" "$_concat_datasets" "$_disp" "" "" "" "$_current_step")
+                    _dd_options="$_dd_options $_dd_opt"
+                    verbose "  DD: $_last_ddname -> $_dd_opt (concatenated, flushed)"
+                fi
+
+                # Generate inline data files first (except SYSIN which is piped)
+                if [ -n "$_inline_dds" ]; then
+                    # Process each DD name (one per line)
+                    while IFS= read -r _dd_name; do
+                        if [ -n "$_dd_name" ]; then
+                            # Parse content fresh from JCL (same as SYSIN)
+                            _dd_content=$(parse_inline_data "$_jcl_content" "$_dd_name")
+                            _inline_block=$(generate_inline_data_file "$_jobname" "$_current_step" "$_dd_name" "$_dd_content")
+                            _script="$_script$_inline_block"
+                        fi
+                    done <<INLINE_DD_NAMES
+$_inline_dds
+INLINE_DD_NAMES
+                fi
+
+                # Add stdout/stderr to log files list
+                _stepname_lower=$(to_lowercase "$_current_step")
+                _log_files="$_log_files\$LOG_DIR/${_jobname}_${_stepname_lower}_stdout.log
+\$LOG_DIR/${_jobname}_${_stepname_lower}_stderr.log
+"
+                _cmd=$(generate_mvscmd_command "$_current_step" "$_current_pgm" "$_current_parm" "$_jobname" $_dd_options)
+                _block=$(generate_step_block "$_current_step" "$_cmd" "$_log_files" "$_sysin_content")
+                _script="$_script
+$_block"
+            fi
+
+            # Parse new step
+            _step_data=$(parse_jcl_step "$_line")
+            _current_step=$(echo "$_step_data" | cut -d'|' -f1)
+            _current_pgm=$(echo "$_step_data" | cut -d'|' -f2)
+            _current_parm=$(echo "$_step_data" | cut -d'|' -f3)
+
+            # Generate default step name if empty or if it's actually "EXEC" (unnamed step)
+            if [ -z "$_current_step" ] || [ "$_current_step" = "EXEC" ]; then
+                _step_counter=$((_step_counter + 1))
+                _current_step="STEP${_step_counter}"
+                verbose "Generated step name: $_current_step"
+            fi
+
+            _dd_options=""
+            _inline_dds=""
+            _log_files=""
+            _sysin_content=""
+            _last_ddname=""
+            _concat_datasets=""
+            _in_step=1
+
+            verbose "Processing step: $_current_step (PGM=$_current_pgm)"
+            continue
+        fi
+
+        # Check for DD statement
+        if [ $_in_step -eq 1 ] && echo "$_line" | grep -q " DD "; then
+            _dd_data=$(parse_dd_statement "$_line")
+            _ddname=$(echo "$_dd_data" | cut -d'|' -f1)
+            _dsn=$(echo "$_dd_data" | cut -d'|' -f2)
+            _disp=$(echo "$_dd_data" | cut -d'|' -f3)
+            _sysout=$(echo "$_dd_data" | cut -d'|' -f4)
+            _dummy=$(echo "$_dd_data" | cut -d'|' -f5)
+            _inline=$(echo "$_dd_data" | cut -d'|' -f6)
+
+            # Set environment variables for log path generation
+            export JOB_NAME="$_jobname"
+            export STEP_NAME="$_current_step"
+
+            # If this is inline data (DD *), set flag to skip content lines
+            if [ -n "$_inline" ]; then
+                _in_inline_data=1
+            fi
+
+            # Check if this is a DD concatenation (ddname is "DD")
+            if [ "$_ddname" = "DD" ] && [ -n "$_last_ddname" ] && [ -n "$_dsn" ]; then
+                # This is a continuation - concatenate to previous DD
+                _concat_datasets="$_concat_datasets:$_dsn"
+                verbose "  DD: (concat to $_last_ddname) -> $_dsn"
+                continue
+            fi
+
+            # If we have accumulated concatenated datasets, output them now
+            if [ -n "$_concat_datasets" ] && [ -n "$_last_ddname" ]; then
+                _dd_opt=$(map_dd_to_option "$_last_ddname" "$_concat_datasets" "$_disp" "" "" "" "$_current_step")
+                _dd_options="$_dd_options $_dd_opt"
+                verbose "  DD: $_last_ddname -> $_dd_opt (concatenated)"
+                _concat_datasets=""
+            fi
+
+            # Start new DD or handle non-concatenated DD
+            if [ -n "$_dsn" ]; then
+                # Start potential concatenation
+                _last_ddname="$_ddname"
+                _concat_datasets="$_dsn"
+            else
+                # Non-DSN DD (SYSOUT, DUMMY, inline, etc.)
+                _last_ddname=""
+                _concat_datasets=""
+
+                # If inline data, extract content and store it
+                if [ -n "$_inline" ]; then
+                    _inline_content=$(parse_inline_data "$_jcl_content" "$_ddname")
+
+                    # SYSIN is handled specially - stored separately for piping
+                    if [ "$_ddname" = "SYSIN" ]; then
+                        _sysin_content="$_inline_content"
+                        verbose "  DD: $_ddname -> inline data ($(echo "$_inline_content" | wc -l) lines) [will be piped to stdin]"
+                    else
+                        # Store DD name for later processing
+                        # We'll call parse_inline_data again when generating files
+                        if [ -z "$_inline_dds" ]; then
+                            _inline_dds="$_ddname"
+                        else
+                            _inline_dds="$_inline_dds
+$_ddname"
+                        fi
+                        verbose "  DD: $_ddname -> inline data ($(echo "$_inline_content" | wc -l) lines)"
+                    fi
+                fi
+
+                _dd_opt=$(map_dd_to_option "$_ddname" "$_dsn" "$_disp" "$_sysout" "$_dummy" "$_inline" "$_current_step")
+                _dd_options="$_dd_options $_dd_opt"
+                verbose "  DD: $_ddname -> $_dd_opt"
+
+                # If this is a SYSOUT DD, collect the log file path
+                if [ -n "$_sysout" ]; then
+                    _logfile=$(map_sysout_to_logfile "$_ddname")
+                    _log_files="$_log_files$_logfile
+"
+                fi
+            fi
+        fi
+    done <<EOF
+$_jcl_content
+EOF
+
+    # Generate last step if any
+    if [ -n "$_current_step" ]; then
+        # Flush any pending concatenated datasets
+        if [ -n "$_concat_datasets" ] && [ -n "$_last_ddname" ]; then
+            _dd_opt=$(map_dd_to_option "$_last_ddname" "$_concat_datasets" "$_disp" "" "" "" "$_current_step")
+            _dd_options="$_dd_options $_dd_opt"
+            verbose "  DD: $_last_ddname -> $_dd_opt (concatenated, final flush)"
+        fi
+
+        # Generate inline data files first (except SYSIN which is piped)
+        if [ -n "$_inline_dds" ]; then
+            # Process each DD name (one per line)
+            while IFS= read -r _dd_name; do
+                if [ -n "$_dd_name" ]; then
+                    # Parse content fresh from JCL (same as SYSIN)
+                    _dd_content=$(parse_inline_data "$_jcl_content" "$_dd_name")
+                    _inline_block=$(generate_inline_data_file "$_jobname" "$_current_step" "$_dd_name" "$_dd_content")
+                    _script="$_script$_inline_block"
+                fi
+            done <<INLINE_DD_NAMES
+$_inline_dds
+INLINE_DD_NAMES
+        fi
+
+        # Add stdout/stderr to log files list
+        _stepname_lower=$(to_lowercase "$_current_step")
+        _log_files="$_log_files\$LOG_DIR/${_jobname}_${_stepname_lower}_stdout.log
+\$LOG_DIR/${_jobname}_${_stepname_lower}_stderr.log
+"
+        _cmd=$(generate_mvscmd_command "$_current_step" "$_current_pgm" "$_current_parm" "$_jobname" $_dd_options)
+        _block=$(generate_step_block "$_current_step" "$_cmd" "$_log_files" "$_sysin_content")
+        _script="$_script
+$_block"
+    fi
+
+    # Generate footer
+    _script="$_script
+$(generate_script_footer "$_jobname")"
+
+    # Output script
+    if [ $DRY_RUN -eq 1 ]; then
+        echo "=== DRY RUN - Generated Script ==="
+        echo "$_script"
+        echo "=== END DRY RUN ==="
+    elif [ -n "$OUTPUT_FILE" ]; then
+        echo "$_script" > "$OUTPUT_FILE"
+        chmod +x "$OUTPUT_FILE"
+        format_success "Generated script: $OUTPUT_FILE"
+    else
+        echo "$_script"
+    fi
+}
+
+# Main entry point
+main() {
+    # Setup cleanup trap
+    setup_trap
+
+    # Parse command-line arguments
+    parse_arguments "$@"
+
+    # Validate ZOAU if not dry-run
+    if [ $DRY_RUN -eq 0 ]; then
+        check_mvscmd
+    fi
+
+    # Perform translation
+    translate_jcl "$JCL_FILE"
+}
+
+# Run main function
+main "$@"
