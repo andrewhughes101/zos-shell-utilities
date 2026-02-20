@@ -102,12 +102,12 @@ install_tool() {
     local url=$(get_download_url "$tool")
     local temp_file=$(mktemp)
 
-    info "📥 Downloading $tool..."
+    info "Downloading $tool..."
 
     if curl -fsSL "$url" -o "$temp_file"; then
         mv "$temp_file" "$install_dir/$tool"
         chmod +x "$install_dir/$tool"
-        success "✓ Installed $tool"
+        success "Installed $tool"
         return 0
     else
         rm -f "$temp_file"
@@ -176,5 +176,4 @@ main() {
     info ""
 }
 
-# Run main function
 main

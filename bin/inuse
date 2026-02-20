@@ -4,6 +4,14 @@
 # Shows which jobs/systems are using a specified dataset
 #
 
+# Get script directory and source libraries
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LIB_DIR="$SCRIPT_DIR/../lib"
+
+. "$LIB_DIR/common.sh"
+. "$LIB_DIR/output_formatter.sh"
+. "$LIB_DIR/zoau_utils.sh"
+
 usage() {
     cat << 'EOF'
 Usage: inuse [OPTIONS] <dataset>
@@ -28,15 +36,6 @@ Output:
 
 EOF
     exit 1
-}
-
-check_zoau() {
-    if ! command -v opercmd >/dev/null 2>&1; then
-        echo "Error: ZOAU is not available or not in PATH" >&2
-        echo "Please ensure ZOAU is properly installed and configured" >&2
-        echo "Hint: Check that ZOAU bin directory is in your PATH" >&2
-        exit 1
-    fi
 }
 
 # Parse GRS output into pipe-delimited format: LPAR|JOBNAME|ASID|TCBADDR|LOCK|STATUS
@@ -145,18 +144,14 @@ parse_arguments() {
                 shift
                 ;;
             -*)
-                echo "Error: Unknown option: $1" >&2
-                echo "Use -h or --help for usage information" >&2
-                exit 1
+                error_exit "Unknown option: $1"
                 ;;
             *)
                 if [ -z "$DATASET" ]; then
                     # Convert dataset name to uppercase for z/OS compatibility
-                    DATASET=$(echo "$1" | tr '[:lower:]' '[:upper:]')
+                    DATASET=$(to_uppercase "$1")
                 else
-                    echo "Error: Multiple datasets specified" >&2
-                    echo "Use -h or --help for usage information" >&2
-                    exit 1
+                    error_exit "Multiple datasets specified"
                 fi
                 shift
                 ;;
@@ -164,11 +159,7 @@ parse_arguments() {
     done
 
     # Validate dataset was provided
-    if [ -z "$DATASET" ]; then
-        echo "Error: Dataset name required" >&2
-        echo "Use -h or --help for usage information" >&2
-        exit 1
-    fi
+    validate_required "$DATASET" "Dataset name"
 }
 
 query_dataset_usage() {
